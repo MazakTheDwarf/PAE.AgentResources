@@ -1,0 +1,55 @@
+# PAE.AgentResources — Agent Name Pool
+# Names are drawn in order. First available name not already in the Agents table is assigned.
+# Pool: mythological, celestial, imperial — culturally varied, universally resonant.
+
+names:
+  - Nova
+  - Atlas
+  - Lyra
+  - Ceres
+  - Orion
+  - Vega
+  - Cassius
+  - Iris
+  - Helios
+  - Theia
+  - Corvus
+  - Selene
+  - Daedalus
+  - Arion
+  - Calyx
+  - Tethys
+  - Oberon
+  - Nyx
+  - Sirius
+  - Calliope
+  - Draco
+  - Aether
+  - Minerva
+  - Hyperion
+  - Clio
+  - Zephyr
+  - Electra
+  - Marcellus
+  - Phaedra
+  - Solaris
+  - Cassian
+  - Eris
+  - Leonidas
+  - Mira
+  - Cygnus
+  - Aurelia
+  - Pythia
+  - Stellan
+  - Vesper
+  - Caelum
+  - Andromeda
+  - Titan
+  - Lycia
+  - Meridian
+  - Sable
+  - Altair
+  - Pax
+  - Rhea
+  - Lumen
+  - Arden

@@ -636,13 +636,19 @@ def healthz() -> dict[str, str]:
 
 
 @app.get("/api/agents")
-def get_agents() -> list[dict[str, str]]:
-    roster: list[dict[str, str]] = []
+def get_agents() -> list[dict]:
+    roster: list[dict] = []
     for agent_dir in _list_agent_dirs():
         payload = _read_agent_payload(agent_dir)
         character = payload["agent_yml"].get("character", {})
         role = str(character.get("professional_title", "")).strip()
-        roster.append({"name": payload["name"], "role": role})
+        raw_templates = payload["agent_yml"].get("supported_templates")
+        supported_templates = (
+            [str(t).strip() for t in raw_templates if str(t).strip()]
+            if isinstance(raw_templates, list)
+            else []
+        )
+        roster.append({"name": payload["name"], "role": role, "supported_templates": supported_templates})
     return roster
 
 

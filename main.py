@@ -1,29 +1,25 @@
 """
 PAE.AgentResources — Julie, HR Director of the Empire.
 
-Julie is a Paladin (Oath of Devotion), Lawful Good, Southern American.
-She manages the full agent lifecycle:
-  - RAG dirty queue: embed changed files with 6-hour debounce
-  - Identity proposals: review and commit agent self-edits to Gitea
-  - Level-up proposals: validate stat allocation and commit reasoning to git
-  - Credits: enforce economy on hire requests
-  - Names: sole authority for assigning new agent names
-
-Polling loop: every AGENT_POLL_INTERVAL_SECONDS (default 300).
+Runs two responsibilities in one process:
+  1) FastAPI service (agent identity authority)
+  2) Background polling daemon (RAG/identity/level-up processing)
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote, urlparse
 
 import httpx
 import yaml
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env.local"))
 
@@ -38,9 +34,10 @@ _logger = logging.getLogger("julie")
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://mcp-server:5088").rstrip("/")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "local-dev-key")
 GITEA_TOKEN = os.environ.get("AGENT_GITEA_TOKEN") or os.environ.get("GITEA_TOKEN", "")
-AGENT_REPO = os.environ.get("AGENT_REPO_URL", "").rstrip("/")  # e.g. https://git.../Nova_2761/pae-agents
+AGENT_REPO = os.environ.get("AGENT_REPO_URL", "").rstrip("/")
 DEBOUNCE_HOURS = float(os.environ.get("AGENT_EMBED_DEBOUNCE_HOURS", "6"))
 POLL_INTERVAL = int(os.environ.get("AGENT_POLL_INTERVAL_SECONDS", "300"))
+API_PORT = int(os.environ.get("PORT", "8092"))
 
 NAMES_FILE = os.path.join(os.path.dirname(__file__), "names.yml")
 ACCENTS_FILE = os.path.join(os.path.dirname(__file__), "accents.yml")
@@ -50,6 +47,20 @@ _gitea_headers = {"Authorization": f"token {GITEA_TOKEN}", "Content-Type": "appl
 
 # Per-agent: tracks last embedded timestamp for debounce
 _last_embedded: dict[str, datetime] = {}
+
+
+def _parse_repo_url(repo_url: str) -> tuple[str, str, str]:
+    parsed = urlparse(repo_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(f"Invalid AGENT_REPO_URL: {repo_url}")
+    segments = [s for s in parsed.path.strip("/").split("/") if s]
+    if len(segments) < 2:
+        raise RuntimeError(f"AGENT_REPO_URL must include owner/repo: {repo_url}")
+    owner, repo = segments[-2], segments[-1]
+    return f"{parsed.scheme}://{parsed.netloc}", owner, repo
+
+
+GITEA_BASE_URL, GITEA_OWNER, GITEA_REPO = _parse_repo_url(AGENT_REPO)
 
 
 # ─── Server helpers ───────────────────────────────────────────────────────────
@@ -77,10 +88,50 @@ def server_post(path: str, body: dict) -> bool:
 # ─── Gitea helpers ────────────────────────────────────────────────────────────
 
 def _repo_api(path: str) -> str:
-    """Build Gitea API URL for pae-agents repo."""
-    # AGENT_REPO is like https://git.davidbaity.com/Nova_2761/pae-agents
-    base = AGENT_REPO.replace("/Nova_2761/pae-agents", "")
-    return f"{base}/api/v1/repos/Nova_2761/pae-agents/contents/{path}"
+    path_enc = quote(path, safe="/")
+    return (
+        f"{GITEA_BASE_URL}/api/v1/repos/"
+        f"{quote(GITEA_OWNER, safe='')}/{quote(GITEA_REPO, safe='')}/contents/{path_enc}"
+    )
+
+
+def gitea_get(file_path: str) -> tuple[dict | list | None, int]:
+    try:
+        r = httpx.get(_repo_api(file_path), headers=_gitea_headers, timeout=10)
+    except Exception as e:
+        _logger.error("gitea_get_failed path=%s error=%s", file_path, e)
+        raise
+    if r.status_code == 404:
+        return None, 404
+    r.raise_for_status()
+    return r.json(), r.status_code
+
+
+def gitea_get_text(file_path: str, required: bool = True) -> str:
+    import base64
+
+    payload, status = gitea_get(file_path)
+    if payload is None and status == 404:
+        if required:
+            raise HTTPException(status_code=404, detail=f"Missing required file: {file_path}")
+        return ""
+    if not isinstance(payload, dict):
+        if required:
+            raise HTTPException(status_code=500, detail=f"Invalid file payload: {file_path}")
+        return ""
+
+    content = payload.get("content")
+    if not isinstance(content, str) or not content:
+        if required:
+            raise HTTPException(status_code=500, detail=f"Invalid file payload: {file_path}")
+        return ""
+
+    try:
+        return base64.b64decode(content).decode("utf-8")
+    except Exception:
+        if required:
+            raise HTTPException(status_code=500, detail=f"Failed to decode file: {file_path}")
+        return ""
 
 
 def gitea_put(file_path: str, content: str, message: str) -> bool:
@@ -89,6 +140,7 @@ def gitea_put(file_path: str, content: str, message: str) -> bool:
         _logger.warning("gitea_no_token — skipping commit for %s", file_path)
         return False
     import base64
+
     encoded = base64.b64encode(content.encode()).decode()
     url = _repo_api(file_path)
     # Get current SHA if file exists
@@ -111,6 +163,51 @@ def gitea_put(file_path: str, content: str, message: str) -> bool:
     except Exception as e:
         _logger.error("gitea_commit_failed file=%s error=%s", file_path, e)
         return False
+
+
+def _list_agent_dirs() -> list[str]:
+    payload, status = gitea_get("")
+    if payload is None and status == 404:
+        raise HTTPException(status_code=404, detail="Agent repo root not found")
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=500, detail="Agent repo listing is invalid")
+    return [
+        str(item.get("name", ""))
+        for item in payload
+        if isinstance(item, dict) and item.get("type") == "dir" and item.get("name")
+    ]
+
+
+def _find_agent_dir(agent_name: str) -> str:
+    desired = agent_name.strip().lower()
+    if not desired:
+        raise HTTPException(status_code=400, detail="Agent name is required")
+    for name in _list_agent_dirs():
+        if name.lower() == desired:
+            return name
+    raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
+
+
+def _read_agent_payload(agent_dir: str) -> dict:
+    agent_yml_raw = gitea_get_text(f"{agent_dir}/agent.yml", required=True)
+    agent_md = gitea_get_text(f"{agent_dir}/identity.md", required=True)
+    agent_json = (
+        gitea_get_text(f"{agent_dir}/agent.json", required=False)
+        or gitea_get_text(f"{agent_dir}/rag/agent.rag.json", required=False)
+    )
+    agent_rag_md = gitea_get_text(f"{agent_dir}/rag/agent.rag.md", required=False)
+
+    agent_yml = yaml.safe_load(agent_yml_raw)
+    if not isinstance(agent_yml, dict):
+        raise HTTPException(status_code=500, detail=f"Invalid YAML for agent: {agent_dir}")
+
+    return {
+        "name": str(agent_yml.get("name", agent_dir)).strip() or agent_dir,
+        "agent_yml": agent_yml,
+        "agent_md": agent_md,
+        "agent_json": agent_json,
+        "agent_rag_md": agent_rag_md,
+    }
 
 
 # ─── RAG Dirty Queue ──────────────────────────────────────────────────────────
@@ -139,7 +236,6 @@ def process_rag_dirty():
             entry_id = entry.get("id")
             file_path = entry.get("filePath", "")
             content_md = entry.get("contentMd", "")
-            content_hash = entry.get("contentHash", "")
 
             # Write the .md file to Gitea
             gitea_path = f"{agent_name}/rag/{os.path.basename(file_path)}"
@@ -169,8 +265,6 @@ def process_identity_proposals():
                         {"accepted": False, "reason": "Empty proposal content."})
             continue
 
-        # Auto-accept proposals that contain ## Character and ## CoreDirectives
-        # (basic sanity check — a real deployment might route to LLM for deeper review)
         if "## CoreDirectives" in proposed:
             gitea_put(f"{agent_name}/identity.md", proposed,
                       f"Identity update: {agent_name} — self-proposed revision")
@@ -223,13 +317,11 @@ def process_levelup_proposals():
                         {"reason": "No stat may exceed 10."})
             continue
 
-        # Valid — accept and commit
         commit_message = (
             f"Level-up: {agent_name} spends {points} points\n\n"
             f"Allocation: {json.dumps(allocation)}\n\n"
             f"In {agent_name}'s words:\n{reasoning}"
         )
-        # Fetch and update agent.yml stats in Gitea (best-effort)
         _apply_levelup_to_gitea(agent_name, allocation, commit_message)
         server_post(f"/api/agents/{agent_name}/level-up/{proposal_id}/accept", {})
         _logger.info("levelup_accepted agent=%s allocation=%s", agent_name, allocation)
@@ -258,10 +350,10 @@ def _apply_levelup_to_gitea(agent_name: str, allocation: dict[str, int], commit_
         _logger.error("levelup_gitea_apply_failed agent=%s error=%s", agent_name, e)
 
 
-# ─── Main Loop ────────────────────────────────────────────────────────────────
+# ─── Runtime ──────────────────────────────────────────────────────────────────
 
-def run():
-    _logger.info("julie_online — PAE.AgentResources HR Director starting up")
+def run_poll_loop():
+    _logger.info("julie_online — PAE.AgentResources HR Director polling loop starting")
     _logger.info("poll_interval=%ds debounce_hours=%.1f", POLL_INTERVAL, DEBOUNCE_HOURS)
 
     while True:
@@ -277,5 +369,38 @@ def run():
         time.sleep(POLL_INTERVAL)
 
 
+app = FastAPI(title="PAE.AgentResources", version="38.0")
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    threading.Thread(target=run_poll_loop, daemon=True).start()
+    _logger.info("agent_resources_api_online=true port=%d", API_PORT)
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/agents")
+def get_agents() -> list[dict[str, str]]:
+    roster: list[dict[str, str]] = []
+    for agent_dir in _list_agent_dirs():
+        payload = _read_agent_payload(agent_dir)
+        character = payload["agent_yml"].get("character", {})
+        role = str(character.get("professional_title", "")).strip()
+        roster.append({"name": payload["name"], "role": role})
+    return roster
+
+
+@app.get("/api/agents/{name}")
+def get_agent(name: str) -> dict:
+    agent_dir = _find_agent_dir(name)
+    return _read_agent_payload(agent_dir)
+
+
 if __name__ == "__main__":
-    run()
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT)

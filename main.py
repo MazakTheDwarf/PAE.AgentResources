@@ -18,6 +18,7 @@ import httpx
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "MCP.Library")))
 
@@ -658,7 +659,132 @@ def get_agent(name: str) -> dict:
     return _read_agent_payload(agent_dir)
 
 
-if __name__ == "__main__":
+# ─── Agent Hire ───────────────────────────────────────────────────────────────
+
+class HireRequest(BaseModel):
+    task_type: str
+    context: str = ""
+    project_id: str = ""
+
+
+def _pick_available_name() -> str:
+    """Return the first name from names.yml not already used as an agent dir."""
+    try:
+        with open(NAMES_FILE) as f:
+            pool = yaml.safe_load(f).get("names", [])
+    except Exception:
+        pool = ["Nova", "Atlas", "Lyra", "Ceres", "Orion"]
+    existing = {d.lower() for d in _list_agent_dirs()}
+    for name in pool:
+        if name.lower() not in existing:
+            return name
+    return f"Agent-{int(time.time())}"
+
+
+def _generate_agent_files(agent_name: str, task_type: str, context: str) -> tuple[str, str]:
+    """Call LLM to produce agent.yml + identity.md for a new hire. Returns (yml_text, md_text)."""
+    if not _or_client:
+        raise HTTPException(status_code=503, detail="LLM client not initialised")
+
+    system_prompt = (
+        "You are the Imperial HR Director. Generate agent identity files in EXACT format. "
+        "Respond with ONLY the two file blocks separated by === markers — no extra commentary."
+    )
+    user_prompt = f"""Create a new Imperial agent named {agent_name} specialised in {task_type} tasks.
+Context about the work: {context or f'Agent will handle {task_type} work for the Empire.'}
+
+=== agent.yml ===
+name: {agent_name}
+model: openai/gpt-4o-mini
+role: Specialist
+supported_templates:
+  - {task_type}
+character:
+  professional_title: "<fitting title for {task_type} expertise>"
+  alignment_professional: "<2-3 word alignment>"
+  stats:
+    intellect: <1-10>
+    wisdom: <1-10>
+    charisma: <1-10>
+    constitution: <1-10>
+    dexterity: <1-10>
+    strength: <1-10>
+  traits:
+    - "<defining trait>"
+    - "<second trait>"
+  flaws:
+    - "<meaningful flaw>"
+    - "<second flaw>"
+
+=== identity.md ===
+## CoreDirectives
+<3-4 sentences: what this agent does and how they approach {task_type} work>
+
+## CommunicationStyle
+<2-3 sentences about tone, format, and delivery>
+
+## KnownLimitations
+<2 sentences: what this agent explicitly does NOT do>
+
+## PeerReputations
+- Adam: <one-line working relationship>
+- Spectrum: <one-line>
+- Scribner: <one-line>
+
+## VoiceRules
+**IMPERIAL VOICE always.** <1-2 specific rules for this agent's deliverable style>
+"""
+    text, err = _or_client.complete(
+        system=system_prompt,
+        user=user_prompt,
+        model="openai/gpt-4o-mini",
+        max_tokens=900,
+    )
+    if err or not text:
+        raise HTTPException(status_code=500, detail=f"LLM generation failed: {err}")
+
+    # Parse === agent.yml === and === identity.md === blocks
+    parts = text.split("===")
+    agent_yml_text = ""
+    identity_md_text = ""
+    for i, part in enumerate(parts):
+        key = part.strip()
+        if key == "agent.yml" and i + 1 < len(parts):
+            agent_yml_text = parts[i + 1].strip()
+        elif key == "identity.md" and i + 1 < len(parts):
+            identity_md_text = parts[i + 1].strip()
+
+    if not agent_yml_text or not identity_md_text:
+        raise HTTPException(status_code=500, detail="LLM response missing expected file blocks")
+
+    return agent_yml_text, identity_md_text
+
+
+@app.post("/api/agents/hire")
+def hire_agent(req: HireRequest) -> dict:
+    """Hire a new agent certified for the requested task_type."""
+    task_type = req.task_type.strip()
+    if not task_type:
+        raise HTTPException(status_code=400, detail="task_type is required")
+
+    agent_name = _pick_available_name()
+    agent_slug = agent_name.lower().replace(" ", "-")
+
+    _logger.info("agent_hire_start=true name=%s task_type=%s", agent_name, task_type)
+
+    agent_yml_text, identity_md_text = _generate_agent_files(agent_name, task_type, req.context)
+
+    ok1 = gitea_put(f"{agent_slug}/agent.yml", agent_yml_text, f"Hire: {agent_name} for {task_type}")
+    ok2 = gitea_put(f"{agent_slug}/identity.md", identity_md_text, f"Hire: {agent_name} identity")
+
+    if not ok1 or not ok2:
+        raise HTTPException(status_code=500, detail="Failed to commit agent files to Gitea")
+
+    _logger.info("agent_hired=true name=%s slug=%s task_type=%s", agent_name, agent_slug, task_type)
+    return {"agent_name": agent_name, "agent_dir": agent_slug, "task_type": task_type, "status": "created"}
+
+
+
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=API_PORT)

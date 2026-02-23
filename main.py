@@ -204,10 +204,12 @@ def _list_agent_dirs() -> list[str]:
 
 def _find_agent_dir(agent_name: str) -> str:
     desired = agent_name.strip().lower()
+    desired_hyphenated = desired.replace(" ", "-")
     if not desired:
         raise HTTPException(status_code=400, detail="Agent name is required")
     for name in _list_agent_dirs():
-        if name.lower() == desired:
+        name_lower = name.lower()
+        if name_lower == desired or name_lower == desired_hyphenated:
             return name
     raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
 
@@ -431,6 +433,18 @@ def process_adjudication_queue() -> None:
         if result.error:
             _logger.error("adjudication_failed task_id=%s error=%s", task_id, result.error)
             continue
+
+        # Sprint 40: persist debug tasklog to Gitea if template.debug == True
+        if result.debug_log:
+            tasklog_path = f"tasklogs/adjudication-{task_id}.md"
+            gitea_put(
+                tasklog_path,
+                result.debug_log,
+                f"[debug] adjudication tasklog task-{task_id}",
+                owner="pae-projects",
+                repo=project_slug,
+            )
+
         _logger.info("adjudication_complete task_id=%s worker=%s", task_id, worker_name)
 
 
